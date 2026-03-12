@@ -36,6 +36,8 @@ normalized_df = (df.filter(pl.col('title').str.contains(cheese_type_pattern))
                     .then(pl.lit('сыр ванильный'))
                     .when(pl.col('title').str.contains(r'(?i)творожный'))
                     .then(pl.lit('сыр творожный'))
+                    .when(pl.col('title').str.contains(r'(?i)плавленый'))
+                    .then(pl.lit('сыр плавленый'))
                     .otherwise(pl.lit('сыр обычный'))
                     .alias('cheese_type'),
 
