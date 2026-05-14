@@ -37,6 +37,17 @@ CONFIG = {
     'batch_size': 1000,
 }
 
+CHEESE_COLUMNS = [
+    'user_id', 'id', 'date_actual', 'title', 'sum', 'quantity',
+    'is_mm', 'check_id', 'cheese_type', 'is_canceled',
+    'weight', 'fat_percentage', 'brand', 'flavor'
+]
+
+REGULAR_COLUMNS = [
+    'user_id', 'id', 'date_actual', 'title', 'sum', 'quantity',
+    'is_mm', 'check_id', 'category', 'is_canceled'
+]
+
 CREAMY = r'(?i)сливочный|cream\s*cheese|кремовый'
 CURD = r'(?i)творожный'
 MELTED = r'(?i)плавленый'
@@ -92,14 +103,16 @@ def insert_data(df: pl.DataFrame, table: str, client) -> bool:
         return True
     
     try:
+        logger.info(f'inserting nw data, columns: {df.columns}')
+
         arrow_table = df.to_arrow()
 
         columns = df.columns
 
-        client.insert(
+        client.insert_arrow(
             table=table,
-            data=arrow_table,
-            column_names=columns,
+            arrow_table=arrow_table,
+            #column_names=columns,
             settings={'async_insert': 1, 'wait_for_async_insert': 0}
         )
         logger.info(f'inserted {len(df)} rows in {table}')
@@ -117,7 +130,7 @@ def insert_data(df: pl.DataFrame, table: str, client) -> bool:
 
 '''
 this function needs to be implemented with firstada's internal api with which they get transaction info in the first place
-we dont have acces to it so t his function isnt functional :p
+we dont have acces to it so this part of the code isnt functional :p
 '''
 def fetch_new_data():
     sleep(60)
@@ -152,7 +165,7 @@ def normalize_cheese(df) -> pl.DataFrame:
     result = (
         df_cheese.with_columns(
             pl.col('user_id').cast(pl.Utf8),
-            pl.col('date_actual').str.to_datetime(),
+            pl.col('date_actual').str.to_datetime().cast(pl.Date),
             pl.col('sum').cast(pl.Float32),
             pl.col('quantity').cast(pl.Float32),
             pl.col('is_mm').cast(pl.Boolean),
@@ -165,9 +178,9 @@ def normalize_cheese(df) -> pl.DataFrame:
             
             is_canceled=pl.col('title').str.contains(r'(?i)возмещение').cast(pl.Boolean),
 
-            weight=pl.col('title').str.extract(WEIGHT_PATTERN, 1).cast(pl.Float32),
+            weight=pl.col('title').str.extract(WEIGHT_PATTERN, 1).cast(pl.Float32, strict=False).fill_null(0.0),
 
-            fat_percentage=pl.col('title').str.extract(FAT_PERCENTAGE_PATTERN, 1).replace(['', 'null', 'None'], None).cast(pl.Float32, strict=False),
+            fat_percentage=pl.col('title').str.extract(FAT_PERCENTAGE_PATTERN, 1).cast(pl.UInt32, strict=False).fill_null(0),
 
             brand=pl.when(pl.col('title').str.contains(CREAMY_CURD_MELTED))
                     .then(raw_words_list.list.slice(0, mid_idx).list.join(' '))
@@ -179,7 +192,7 @@ def normalize_cheese(df) -> pl.DataFrame:
         )
     ).drop('raw_text')
 
-    return result
+    return result.select(CHEESE_COLUMNS).collect()
 
 
 def normalize_other(df) -> pl.DataFrame:
@@ -192,7 +205,7 @@ def normalize_other(df) -> pl.DataFrame:
     result = (
         df_other_products.with_columns(
             pl.col('user_id').cast(pl.Utf8),
-            pl.col('date_actual').str.to_datetime(),
+            pl.col('date_actual').str.to_datetime().cast(pl.Date),
             pl.col('sum').cast(pl.Float32),
             pl.col('quantity').cast(pl.Float32),
             pl.col('is_mm').cast(pl.Boolean),
@@ -202,36 +215,32 @@ def normalize_other(df) -> pl.DataFrame:
         )
     )
 
-    return result
+    return result.select(REGULAR_COLUMNS).collect()
 
 
-def push_buffer(buffer, client):
-        total_buffered = sum(len(i) for i in buffer)
+def push_buffer(buffer, client, table):
+    total_buffered = sum(len(i) for i in buffer)
 
-        if buffer and (total_buffered >= CONFIG['batch_size'] or (buffer and time() % 60 < CONFIG['poll_interval_sec'])):
-            combined_df = pl.concat(buffer, how='vertical')
+    if buffer and (total_buffered >= CONFIG['batch_size'] or (buffer and time() % 60 < CONFIG['poll_interval_sec'])):
+        combined_df = pl.concat(buffer, how='vertical')
 
-            return insert_data(combined_df, CONFIG['ch_table'], client)
-                
+        return insert_data(combined_df, table, client)
+    return False               
+
 
 def main():
     logger.info('ingest script started')
 
+    buffer_cheese, buffer_regular = [], []
     client = None
 
     try:
-        logger.info(f'connecting to {CONFIG['ch_host']}:{CONFIG['ch_port']}')
+        logger.info(f'connecting to {CONFIG["ch_host"]}:{CONFIG["ch_port"]}')
 
         client = get_client()
-
-        buffer_cheese, buffer_regular = [], []
     except Exception as e:
         logger.error(f'unexpected error during initial load: {e}')
         return
-    finally:
-        if client:
-            client.close()
-            logger.info('connection closed')
 
     logger.info('connection established')
 
@@ -241,13 +250,13 @@ def main():
 
             buffer_cheese.append(new_df['result_cheese'])
             buffer_regular.append(new_df['result_other'])
+
+            logger.info('writing data from file')
+        else:
+            logger.info('database already filled')
     except Exception as e:
         logger.error(f'unexpected error while reading data from file: {e}')
         return
-    finally:
-        if client:
-            client.close()
-            logger.info('connection closed')
 
     try:
         while True:
@@ -261,12 +270,12 @@ def main():
             else:
                 logger.info('no new data recieved')
 
-            if push_buffer(buffer_cheese, client):
+            if push_buffer(buffer_cheese, client, CONFIG['ch_table_cheese']):
                 logger.info(f'succesfully pushed {len(buffer_cheese)} rows')
 
                 buffer_cheese.clear()
 
-            if push_buffer(buffer_regular, client):
+            if push_buffer(buffer_regular, client, CONFIG['ch_table_regular']):
                 logger.info(f'succesfully pushed {len(buffer_regular)} rows')
 
                 buffer_regular.clear()
@@ -283,5 +292,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-# %%
-
